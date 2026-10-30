@@ -280,6 +280,13 @@ function closeDevicePeers(deviceId) {
     }
   }
 
+  // پاک کردن ICEهای باقی‌مانده مربوط به این دستگاه
+  for (const key of [...pendingCandidates.keys()]) {
+    if (key.startsWith(`${deviceId}:`)) {
+      pendingCandidates.delete(key);
+    }
+  }
+
   const preview = document.getElementById(`preview-${deviceId}`);
 
   if (preview) {
@@ -331,6 +338,12 @@ function stopWatching(deviceId) {
     }
   }
 
+  for (const key of [...pendingCandidates.keys()]) {
+    if (key.startsWith(`${deviceId}:`)) {
+      pendingCandidates.delete(key);
+    }
+  }
+
   const preview = document.getElementById(`preview-${deviceId}`);
 
   if (preview) {
@@ -357,6 +370,7 @@ async function handleOffer(message) {
 
   const key = peerKey(deviceId, viewerId);
 
+  // اتصال قبلی همین بیننده را ببند
   closePeer(deviceId, viewerId);
 
   try {
@@ -367,7 +381,11 @@ async function handleOffer(message) {
     });
 
     peers.set(key, pc);
-    pendingCandidates.set(key, []);
+
+    // اگر ICE هنگام بارگذاری تنظیمات رسیده باشد، نگه داشته می‌شود
+    if (!pendingCandidates.has(key)) {
+      pendingCandidates.set(key, []);
+    }
 
     pc.onicecandidate = event => {
       if (!event.candidate) return;
@@ -426,6 +444,7 @@ async function handleOffer(message) {
 
     await pc.setRemoteDescription(message.offer);
 
+    // ICEهایی که قبل از Offer رسیده بودند اکنون اعمال می‌شوند
     const queued = pendingCandidates.get(key) || [];
 
     for (const candidate of queued) {
@@ -439,7 +458,6 @@ async function handleOffer(message) {
     pendingCandidates.set(key, []);
 
     const answer = await pc.createAnswer();
-
     await pc.setLocalDescription(answer);
 
     sendSignal({
@@ -451,9 +469,7 @@ async function handleOffer(message) {
 
   } catch (error) {
     console.error('WebRTC offer error:', error);
-
     closePeer(deviceId, viewerId);
-
     toast('ساخت اتصال WebRTC ناموفق بود.');
   }
 }
@@ -466,7 +482,13 @@ async function handleIce(message) {
   const key = peerKey(deviceId, viewerId);
   const pc = peers.get(key);
 
-  if (!pc) return;
+  // اگر ICE قبل از ساخته‌شدن PeerConnection برسد، در صف می‌ماند
+  if (!pc) {
+    const queue = pendingCandidates.get(key) || [];
+    queue.push(candidate);
+    pendingCandidates.set(key, queue);
+    return;
+  }
 
   try {
     if (pc.remoteDescription) {
