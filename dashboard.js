@@ -1,5 +1,4 @@
 
-
 'use strict';
 
 const $ = (selector) => document.querySelector(selector);
@@ -10,30 +9,25 @@ let currentDevices = [];
 let iceConfig = null;
 let icePromise = null;
 let reconnectTimer = null;
+let activeDeviceId = null;
 
 const peers = new Map();
 const pendingCandidates = new Map();
+const previewStreams = new Map();
 const watchedDevices = new Set();
-
-function peerKey(deviceId, viewerId) {
-  return `${deviceId}:${viewerId}`;
-}
 
 function toast(message) {
   const el = $('#toast');
   if (!el) return;
-
   el.textContent = message;
   el.classList.add('show');
-
-  setTimeout(() => {
-    el.classList.remove('show');
-  }, 2600);
+  setTimeout(() => el.classList.remove('show'), 2600);
 }
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
     ...options,
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {})
@@ -42,15 +36,11 @@ async function api(url, options = {}) {
 
   if (response.status === 401) {
     location.href = '/';
-    throw new Error('ورود لازم است');
+    throw new Error('نشست ورود منقضی شده است.');
   }
 
   const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(data.error || 'خطای درخواست');
-  }
-
+  if (!response.ok) throw new Error(data.error || 'خطای درخواست');
   return data;
 }
 
@@ -92,10 +82,7 @@ async function loadIceServers() {
 }
 
 function sendSignal(message) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return false;
-  }
-
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
   socket.send(JSON.stringify(message));
   return true;
 }
@@ -103,10 +90,9 @@ function sendSignal(message) {
 async function loadRoom() {
   try {
     const data = await api('/api/room');
-
-    $('#qrImage').src = data.qr;
-    $('#qrPlaceholder').classList.add('hidden');
-    $('#shareUrl').value = data.shareUrl;
+    if ($('#qrImage')) $('#qrImage').src = data.qr;
+    $('#qrPlaceholder')?.classList.add('hidden');
+    if ($('#shareUrl')) $('#shareUrl').value = data.shareUrl;
   } catch (error) {
     toast(error.message);
   }
@@ -119,20 +105,25 @@ async function loadData() {
       api('/api/devices')
     ]);
 
-    $('#activeCount').textContent = fa(status.activeCount);
-    $('#registeredCount').textContent = fa(status.registeredCount);
+    if ($('#activeCount')) {
+      $('#activeCount').textContent = fa(status.activeCount || 0);
+    }
 
-    const seconds = status.uptimeSeconds;
+    if ($('#registeredCount')) {
+      $('#registeredCount').textContent = fa(status.registeredCount || 0);
+    }
 
-    $('#uptime').textContent =
-      `${fa(Math.floor(seconds / 3600))}س ` +
-      `${fa(Math.floor((seconds % 3600) / 60))}د`;
+    const seconds = status.uptimeSeconds || 0;
+
+    if ($('#uptime')) {
+      $('#uptime').textContent =
+        `${fa(Math.floor(seconds / 3600))}س ` +
+        `${fa(Math.floor((seconds % 3600) / 60))}د`;
+    }
 
     currentDevices = data.devices || [];
-
-    renderDevices(data.devices || [], data.onlineIds || []);
-    renderHistory(data.events || [], data.devices || []);
-
+    renderDevices(currentDevices, data.onlineIds || []);
+    renderHistory(data.events || [], currentDevices);
   } catch (error) {
     console.error('Dashboard data error:', error);
   }
@@ -140,18 +131,17 @@ async function loadData() {
 
 function renderDevices(devices, onlineIds) {
   const online = new Set(onlineIds);
+  const grid = $('#deviceGrid');
+  if (!grid) return;
 
-  $('#deviceCount').textContent =
-    `${fa(online.size)} دستگاه آنلاین`;
+  const liveDevices = devices.filter(device => online.has(device.id));
 
-  $('#deviceGrid').innerHTML = '';
-
-  const liveDevices = devices.filter(device =>
-    online.has(device.id)
-  );
+  if ($('#deviceCount')) {
+    $('#deviceCount').textContent = `${fa(online.size)} دستگاه آنلاین`;
+  }
 
   if (!liveDevices.length) {
-    $('#deviceGrid').innerHTML = `
+    grid.innerHTML = `
       <div class="empty-state">
         <span>▣</span>
         <b>هنوز دستگاهی متصل نیست</b>
@@ -161,74 +151,94 @@ function renderDevices(devices, onlineIds) {
     return;
   }
 
-  liveDevices.forEach(device => {
-    const card = document.createElement('article');
-    card.className = 'device-card';
+  const existing = new Map(
+    [...grid.querySelectorAll('.device-card')].map(card => [
+      card.dataset.deviceId,
+      card
+    ])
+  );
 
-    const head = document.createElement('div');
-    head.className = 'device-head';
+  for (const device of liveDevices) {
+    let card = existing.get(device.id);
 
-    const info = document.createElement('div');
+    if (!card) {
+      card = document.createElement('article');
+      card.className = 'device-card';
+      card.dataset.deviceId = device.id;
 
-    const name = document.createElement('div');
-    name.className = 'device-name';
-    name.textContent = device.name;
+      const head = document.createElement('div');
+      head.className = 'device-head';
 
-    const id = document.createElement('div');
-    id.className = 'device-id';
-    id.textContent = device.id.slice(0, 16);
+      const info = document.createElement('div');
 
-    info.append(name, id);
+      const name = document.createElement('div');
+      name.className = 'device-name';
+      name.textContent = device.name || 'گوشی';
 
-    const status = document.createElement('span');
-    status.className = 'online';
-    status.textContent = '● ONLINE';
+      const id = document.createElement('div');
+      id.className = 'device-id';
+      id.textContent = device.id.slice(0, 16);
 
-    head.append(info, status);
+      info.append(name, id);
 
-    const preview = document.createElement('div');
-    preview.className = 'preview';
-    preview.id = `preview-${device.id}`;
-    preview.textContent = 'برای درخواست نمایش زنده کلیک کن';
+      const onlineLabel = document.createElement('span');
+      onlineLabel.className = 'online';
+      onlineLabel.textContent = '● ONLINE';
 
-    const actions = document.createElement('div');
-    actions.className = 'device-actions';
+      head.append(info, onlineLabel);
 
-    const watch = document.createElement('button');
-    watch.className = 'primary';
-    watch.textContent = 'درخواست نمایش زنده';
-    watch.addEventListener('click', () => {
-      watchDevice(device.id);
-    });
+      const preview = document.createElement('div');
+      preview.className = 'preview';
+      preview.id = `preview-${device.id}`;
+      preview.textContent = 'برای مشاهده تصویر کلیک کن';
 
-    const stop = document.createElement('button');
-    stop.className = 'ghost';
-    stop.textContent = 'توقف';
-    stop.addEventListener('click', () => {
-      stopWatching(device.id);
-    });
+      const actions = document.createElement('div');
+      actions.className = 'device-actions';
 
-    actions.append(watch, stop);
-    card.append(head, preview, actions);
+      const watch = document.createElement('button');
+      watch.className = 'primary';
+      watch.textContent = 'مشاهده صفحه گوشی';
+      watch.addEventListener('click', () => watchDevice(device.id));
 
-    $('#deviceGrid').append(card);
-  });
+      const stop = document.createElement('button');
+      stop.className = 'ghost';
+      stop.textContent = 'توقف';
+      stop.addEventListener('click', () => stopWatching(device.id));
+
+      actions.append(watch, stop);
+      card.append(head, preview, actions);
+    } else {
+      const name = card.querySelector('.device-name');
+      if (name) name.textContent = device.name || 'گوشی';
+    }
+
+    grid.append(card);
+    existing.delete(device.id);
+
+    const preview = document.getElementById(`preview-${device.id}`);
+    const savedStream = previewStreams.get(device.id);
+
+    if (preview && savedStream && !preview.querySelector('video')) {
+      attachPreview(device.id, savedStream);
+    }
+  }
+
+  for (const [deviceId, card] of existing) {
+    if (activeDeviceId === deviceId) stopWatching(deviceId);
+    card.remove();
+  }
 }
 
 function renderHistory(events, devices) {
-  const names = new Map(
-    devices.map(device => [device.id, device.name])
-  );
-
   const tbody = $('#historyBody');
+  if (!tbody) return;
+
+  const names = new Map(devices.map(device => [device.id, device.name]));
   tbody.innerHTML = '';
 
   if (!events.length) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="4">هنوز رویدادی ثبت نشده است.</td>
-      </tr>
-    `;
+    tbody.innerHTML =
+      '<tr><td colspan="4">هنوز رویدادی ثبت نشده است.</td></tr>';
     return;
   }
 
@@ -237,7 +247,7 @@ function renderHistory(events, devices) {
 
     const values = [
       event.device_name || names.get(event.device_id) || '—',
-      event.event_type,
+      event.event_type || '—',
       new Date(event.created_at).toLocaleString('fa-IR'),
       devices.find(device => device.id === event.device_id)?.sessions ?? '—'
     ];
@@ -252,8 +262,32 @@ function renderHistory(events, devices) {
   });
 }
 
+function attachPreview(deviceId, stream) {
+  const preview = document.getElementById(`preview-${deviceId}`);
+  if (!preview) return;
+
+  let video = preview.querySelector('video');
+
+  if (!video) {
+    preview.innerHTML = '';
+    video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.style.cssText =
+      'width:100%;height:100%;object-fit:contain;background:#000';
+    preview.append(video);
+  }
+
+  if (video.srcObject !== stream) video.srcObject = stream;
+
+  video.play().catch(error => {
+    console.warn('Video autoplay:', error);
+  });
+}
+
 function closePeer(deviceId, viewerId) {
-  const key = peerKey(deviceId, viewerId);
+  const key = `${deviceId}:${viewerId}`;
   const pc = peers.get(key);
 
   if (pc) {
@@ -261,9 +295,7 @@ function closePeer(deviceId, viewerId) {
     pc.ontrack = null;
     pc.onconnectionstatechange = null;
 
-    try {
-      pc.close();
-    } catch (error) {
+    try { pc.close(); } catch (error) {
       console.warn(error);
     }
 
@@ -274,177 +306,132 @@ function closePeer(deviceId, viewerId) {
 }
 
 function closeDevicePeers(deviceId) {
-  for (const [key, pc] of [...peers.entries()]) {
+  for (const [key] of [...peers.entries()]) {
     if (key.startsWith(`${deviceId}:`)) {
-      closePeerFromKey(key, pc);
+      const viewerId = key.slice(deviceId.length + 1);
+      closePeer(deviceId, viewerId);
     }
   }
 
-  // پاک کردن ICEهای باقی‌مانده مربوط به این دستگاه
-  for (const key of [...pendingCandidates.keys()]) {
-    if (key.startsWith(`${deviceId}:`)) {
-      pendingCandidates.delete(key);
-    }
-  }
+  previewStreams.delete(deviceId);
 
   const preview = document.getElementById(`preview-${deviceId}`);
-
   if (preview) {
     preview.innerHTML = '';
     preview.textContent = 'اشتراک‌گذاری متوقف شد';
   }
 }
 
-function closePeerFromKey(key, pc) {
-  pc.onicecandidate = null;
-  pc.ontrack = null;
-  pc.onconnectionstatechange = null;
-
-  try {
-    pc.close();
-  } catch (error) {
-    console.warn(error);
-  }
-
-  peers.delete(key);
-  pendingCandidates.delete(key);
-}
-
 function watchDevice(deviceId) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    toast('اتصال سیگنال هنوز آماده نیست.');
+    toast('اتصال داشبورد آماده نیست.');
     return;
   }
 
+  if (activeDeviceId && activeDeviceId !== deviceId) {
+    toast('ابتدا نمایش دستگاه قبلی را متوقف کن.');
+    return;
+  }
+
+  activeDeviceId = deviceId;
+  watchedDevices.clear();
   watchedDevices.add(deviceId);
 
-  const sent = sendSignal({
-    type: 'watch',
-    deviceId
-  });
-
-  if (sent) {
-    toast('درخواست نمایش ارسال شد؛ صاحب گوشی باید انتخاب صفحه را تأیید کند.');
+  if (sendSignal({ type: 'watch', deviceId })) {
+    toast('درخواست ارسال شد؛ تأیید اشتراک‌گذاری را روی گوشی انجام بده.');
   }
 }
 
 function stopWatching(deviceId) {
   watchedDevices.delete(deviceId);
 
-  for (const key of [...peers.keys()]) {
+  for (const [key] of [...peers.entries()]) {
     if (key.startsWith(`${deviceId}:`)) {
-      const pc = peers.get(key);
-      closePeerFromKey(key, pc);
+      const viewerId = key.slice(deviceId.length + 1);
+      closePeer(deviceId, viewerId);
     }
   }
 
-  for (const key of [...pendingCandidates.keys()]) {
-    if (key.startsWith(`${deviceId}:`)) {
-      pendingCandidates.delete(key);
-    }
-  }
+  previewStreams.delete(deviceId);
 
   const preview = document.getElementById(`preview-${deviceId}`);
-
   if (preview) {
     preview.innerHTML = '';
     preview.textContent = 'نمایش متوقف شد';
   }
 
-  sendSignal({
-    type: 'stop',
-    deviceId
-  });
+  sendSignal({ type: 'stop', deviceId });
 
-  toast('درخواست توقف ارسال شد.');
+  if (activeDeviceId === deviceId) activeDeviceId = null;
+
+  toast('نمایش متوقف شد.');
 }
 
 async function handleOffer(message) {
-  const deviceId = message.deviceId;
-  const viewerId = message.viewerId;
+  const { deviceId, viewerId, offer } = message;
 
-  if (!deviceId || !viewerId || !message.offer) {
-    console.warn('Offer ناقص دریافت شد:', message);
+  if (!deviceId || !viewerId || !offer) return;
+
+  if (activeDeviceId !== deviceId || !watchedDevices.has(deviceId)) {
     return;
   }
 
-  const key = peerKey(deviceId, viewerId);
+  const key = `${deviceId}:${viewerId}`;
 
-  // اتصال قبلی همین بیننده را ببند
   closePeer(deviceId, viewerId);
+
+  // صف جدید را فقط در صورت نبودن صف قبلی ایجاد می‌کنیم.
+  if (!pendingCandidates.has(key)) {
+    pendingCandidates.set(key, []);
+  }
+
+  let pc = null;
 
   try {
     const servers = await loadIceServers();
 
-    const pc = new RTCPeerConnection({
-      iceServers: servers
-    });
+    if (activeDeviceId !== deviceId) return;
 
+    pc = new RTCPeerConnection({ iceServers: servers });
     peers.set(key, pc);
 
-    // اگر ICE هنگام بارگذاری تنظیمات رسیده باشد، نگه داشته می‌شود
-    if (!pendingCandidates.has(key)) {
-      pendingCandidates.set(key, []);
-    }
-
     pc.onicecandidate = event => {
-      if (!event.candidate) return;
-
-      sendSignal({
-        type: 'ice',
-        deviceId,
-        viewerId,
-        candidate: event.candidate
-      });
+      if (event.candidate) {
+        sendSignal({
+          type: 'ice',
+          deviceId,
+          viewerId,
+          candidate: event.candidate
+        });
+      }
     };
 
     pc.ontrack = event => {
-      const preview = document.getElementById(`preview-${deviceId}`);
+      if (peers.get(key) !== pc) return;
 
-      if (!preview) return;
+      const receivedStream = event.streams[0];
+      if (!receivedStream) return;
 
-      let video = preview.querySelector('video');
-
-      if (!video) {
-        preview.innerHTML = '';
-
-        video = document.createElement('video');
-        video.autoplay = true;
-        video.playsInline = true;
-        video.muted = true;
-
-        video.style.cssText =
-          'width:100%;height:100%;object-fit:contain';
-
-        preview.append(video);
-      }
-
-      video.srcObject = event.streams[0];
-
-      video.play().catch(error => {
-        console.warn('Video autoplay:', error);
-      });
+      previewStreams.set(deviceId, receivedStream);
+      attachPreview(deviceId, receivedStream);
     };
 
     pc.onconnectionstatechange = () => {
-      if (!peers.has(key)) return;
+      if (peers.get(key) !== pc) return;
 
       if (pc.connectionState === 'connected') {
-        toast('اتصال نمایش زنده برقرار شد.');
-      }
-
-      if (pc.connectionState === 'failed') {
-        toast('اتصال WebRTC ناموفق بود؛ تنظیمات TURN را بررسی کن.');
-      }
-
-      if (pc.connectionState === 'disconnected') {
-        toast('ارتباط نمایش زنده موقتاً قطع شد.');
+        toast('تصویر گوشی متصل شد.');
+      } else if (pc.connectionState === 'failed') {
+        toast('اتصال ناموفق بود؛ تنظیمات TURN را بررسی کن.');
+      } else if (pc.connectionState === 'disconnected') {
+        toast('ارتباط موقتاً قطع شد.');
       }
     };
 
-    await pc.setRemoteDescription(message.offer);
+    await pc.setRemoteDescription(offer);
 
-    // ICEهایی که قبل از Offer رسیده بودند اکنون اعمال می‌شوند
+    if (peers.get(key) !== pc) return;
+
     const queued = pendingCandidates.get(key) || [];
 
     for (const candidate of queued) {
@@ -460,30 +447,33 @@ async function handleOffer(message) {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
+    if (peers.get(key) !== pc) return;
+
     sendSignal({
       type: 'answer',
       deviceId,
       viewerId,
       answer: pc.localDescription
     });
-
   } catch (error) {
     console.error('WebRTC offer error:', error);
-    closePeer(deviceId, viewerId);
+
+    if (!pc || peers.get(key) === pc) {
+      closePeer(deviceId, viewerId);
+    }
+
     toast('ساخت اتصال WebRTC ناموفق بود.');
   }
 }
 
 async function handleIce(message) {
   const { deviceId, viewerId, candidate } = message;
-
   if (!deviceId || !viewerId || !candidate) return;
 
-  const key = peerKey(deviceId, viewerId);
+  const key = `${deviceId}:${viewerId}`;
   const pc = peers.get(key);
 
-  // اگر ICE قبل از ساخته‌شدن PeerConnection برسد، در صف می‌ماند
-  if (!pc) {
+  if (!pc || !pc.remoteDescription) {
     const queue = pendingCandidates.get(key) || [];
     queue.push(candidate);
     pendingCandidates.set(key, queue);
@@ -491,81 +481,61 @@ async function handleIce(message) {
   }
 
   try {
-    if (pc.remoteDescription) {
-      await pc.addIceCandidate(candidate);
-    } else {
-      const queue = pendingCandidates.get(key) || [];
-      queue.push(candidate);
-      pendingCandidates.set(key, queue);
-    }
+    await pc.addIceCandidate(candidate);
   } catch (error) {
     console.warn('ICE candidate error:', error);
   }
 }
 
 function handleSocketMessage(message) {
-  if (message.type === 'status') {
-    currentDevices = message.devices || [];
-    loadData();
-    return;
-  }
+  switch (message.type) {
+    case 'status':
+      loadData();
+      break;
 
-  if (message.type === 'offer') {
-    handleOffer(message);
-    return;
-  }
+    case 'offer':
+      handleOffer(message);
+      break;
 
-  if (message.type === 'ice') {
-    handleIce(message);
-    return;
-  }
+    case 'ice':
+      handleIce(message);
+      break;
 
-  if (message.type === 'stream-stopped') {
-    if (message.deviceId) {
-      closeDevicePeers(message.deviceId);
-    }
+    case 'stream-stopped':
+      if (message.deviceId) {
+        closeDevicePeers(message.deviceId);
+        if (activeDeviceId === message.deviceId) activeDeviceId = null;
+      }
+      toast('اشتراک‌گذاری گوشی متوقف شد.');
+      break;
 
-    toast('اشتراک‌گذاری توسط گوشی متوقف شد.');
-    return;
-  }
-
-  if (message.type === 'error') {
-    toast(message.message || 'خطای ارتباط');
+    case 'error':
+      toast(message.message || 'خطای ارتباط');
+      break;
   }
 }
 
 function connectSocket() {
-  if (
-    socket &&
-    (socket.readyState === WebSocket.OPEN ||
-     socket.readyState === WebSocket.CONNECTING)
-  ) {
-    return;
-  }
+  if (socket && (
+    socket.readyState === WebSocket.OPEN ||
+    socket.readyState === WebSocket.CONNECTING
+  )) return;
 
-  const protocol =
-    location.protocol === 'https:' ? 'wss:' : 'ws:';
-
-  socket = new WebSocket(
-    `${protocol}//${location.host}/signal`
-  );
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${protocol}//${location.host}/signal`);
 
   socket.onopen = () => {
-    toast('اتصال زنده داشبورد برقرار شد.');
+    toast('اتصال داشبورد برقرار شد.');
 
-    // بازگرداندن درخواست‌های فعال پس از اتصال مجدد
-    for (const deviceId of watchedDevices) {
-      sendSignal({
-        type: 'watch',
-        deviceId
-      });
+    if (activeDeviceId) {
+      watchedDevices.add(activeDeviceId);
+      sendSignal({ type: 'watch', deviceId: activeDeviceId });
     }
   };
 
   socket.onmessage = event => {
     try {
-      const message = JSON.parse(event.data);
-      handleSocketMessage(message);
+      handleSocketMessage(JSON.parse(event.data));
     } catch (error) {
       console.error('Invalid socket message:', error);
     }
@@ -576,23 +546,23 @@ function connectSocket() {
   };
 
   socket.onclose = () => {
-    for (const [key, pc] of [...peers.entries()]) {
-      closePeerFromKey(key, pc);
+    for (const [key] of [...peers.entries()]) {
+      const split = key.indexOf(':');
+      closePeer(key.slice(0, split), key.slice(split + 1));
     }
 
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-    }
+    previewStreams.clear();
+
+    if (reconnectTimer) clearTimeout(reconnectTimer);
 
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectSocket();
-    }, 1800);
+    }, 2000);
   };
 }
 
-// کپی لینک
-$('#copyBtn').addEventListener('click', async () => {
+$('#copyBtn')?.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText($('#shareUrl').value);
     toast('لینک کپی شد.');
@@ -602,32 +572,24 @@ $('#copyBtn').addEventListener('click', async () => {
   }
 });
 
-// ساخت QR جدید
-$('#newQrBtn').addEventListener('click', async () => {
+$('#newQrBtn')?.addEventListener('click', async () => {
   await loadRoom();
-  toast('لینک اتاق به‌روزرسانی شد.');
+  toast('QR جدید ساخته شد.');
 });
 
-// تازه‌سازی اطلاعات
-$('#refreshBtn').addEventListener('click', loadData);
-$('#historyRefresh').addEventListener('click', loadData);
+$('#refreshBtn')?.addEventListener('click', loadData);
+$('#historyRefresh')?.addEventListener('click', loadData);
 
-// خروج
-$('#logoutBtn').addEventListener('click', async () => {
+$('#logoutBtn')?.addEventListener('click', async () => {
   try {
-    await api('/api/logout', {
-      method: 'POST'
-    });
-
+    await api('/api/logout', { method: 'POST' });
     location.href = '/';
   } catch (error) {
     toast(error.message);
   }
 });
 
-// شروع داشبورد
 loadRoom();
 loadData();
 connectSocket();
-
 setInterval(loadData, 10000);
