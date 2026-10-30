@@ -1,4 +1,3 @@
-
 'use strict';
 
 const params = new URLSearchParams(location.search);
@@ -12,10 +11,13 @@ let iceConfig = null;
 let stopping = false;
 let reconnectTimer = null;
 let manuallyDisconnected = false;
+let reconnectAttempts = 0;
 
-const peers = new Map();
+let activeViewerId = null;
+let peer = null;
+
 const pendingViewers = new Set();
-const pendingCandidates = new Map();
+const pendingCandidates = [];
 
 function status(message, error = false) {
   const el = $('#shareStatus');
@@ -42,7 +44,10 @@ async function loadIceServers() {
 
   const response = await fetch(
     `/api/ice-servers?room=${encodeURIComponent(room)}`,
-    { cache: 'no-store' }
+    {
+      cache: 'no-store',
+      credentials: 'same-origin'
+    }
   );
 
   if (!response.ok) {
@@ -60,63 +65,57 @@ async function loadIceServers() {
 }
 
 function sendSocket(data) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return false;
-  }
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
 
   socket.send(JSON.stringify(data));
   return true;
 }
 
-function closeViewer(viewerId) {
-  const pc = peers.get(viewerId);
-
-  if (pc) {
-    pc.onicecandidate = null;
-    pc.ontrack = null;
-    pc.onconnectionstatechange = null;
+function closePeer() {
+  if (peer) {
+    peer.onicecandidate = null;
+    peer.onconnectionstatechange = null;
 
     try {
-      pc.close();
+      peer.close();
     } catch (error) {
       console.warn(error);
     }
 
-    peers.delete(viewerId);
+    peer = null;
   }
 
-  pendingCandidates.delete(viewerId);
-  pendingViewers.delete(viewerId);
+  activeViewerId = null;
+  pendingCandidates.length = 0;
 }
 
 function closeAllPeers(preservePending = false) {
-  const previousViewers = new Set([
-    ...pendingViewers,
-    ...peers.keys()
-  ]);
+  const previousViewer = activeViewerId;
 
-  for (const viewerId of [...peers.keys()]) {
-    closeViewer(viewerId);
-  }
+  closePeer();
 
-  pendingViewers.clear();
-
-  if (preservePending) {
-    for (const viewerId of previousViewers) {
-      pendingViewers.add(viewerId);
-    }
+  if (!preservePending) {
+    pendingViewers.clear();
+  } else if (previousViewer) {
+    pendingViewers.add(previousViewer);
   }
 }
 
 async function createViewerConnection(viewerId) {
-  if (!viewerId || peers.has(viewerId)) return;
+  if (!viewerId || !stream) return;
 
-  if (!stream) {
-    pendingViewers.add(viewerId);
-    status('درخواست نمایش دریافت شد. برای شروع، انتخاب صفحه را بزن.');
+  // فقط یک بیننده مجاز است.
+  if (activeViewerId && activeViewerId !== viewerId) {
+    sendSocket({
+      type: 'error',
+      message: 'این گوشی فقط از یک بیننده پشتیبانی می‌کند.'
+    });
     return;
   }
 
+  if (peer && activeViewerId === viewerId) return;
+
+  activeViewerId = viewerId;
   pendingViewers.add(viewerId);
 
   let pc = null;
@@ -124,21 +123,17 @@ async function createViewerConnection(viewerId) {
   try {
     const servers = await loadIceServers();
 
-    if (!stream || !pendingViewers.has(viewerId)) return;
+    if (!stream || activeViewerId !== viewerId) return;
 
-    pc = new RTCPeerConnection({
-      iceServers: servers
-    });
-
-    peers.set(viewerId, pc);
-    pendingCandidates.set(viewerId, []);
+    pc = new RTCPeerConnection({ iceServers: servers });
+    peer = pc;
 
     stream.getTracks().forEach(track => {
       pc.addTrack(track, stream);
     });
 
     pc.onicecandidate = event => {
-      if (!event.candidate) return;
+      if (!event.candidate || peer !== pc) return;
 
       sendSocket({
         type: 'ice',
@@ -148,29 +143,24 @@ async function createViewerConnection(viewerId) {
     };
 
     pc.onconnectionstatechange = () => {
-      if (peers.get(viewerId) !== pc) return;
+      if (peer !== pc) return;
 
       if (pc.connectionState === 'connected') {
-        status('اتصال نمایش زنده برقرار شد.');
+        status('تصویر گوشی با موفقیت به لپ‌تاپ ارسال شد.');
       } else if (pc.connectionState === 'failed') {
         status('اتصال ناموفق بود. تنظیمات TURN را بررسی کن.', true);
       } else if (pc.connectionState === 'disconnected') {
-        status('ارتباط با یکی از بیننده‌ها قطع شده است.');
+        status('ارتباط با لپ‌تاپ موقتاً قطع شده است.');
       }
     };
 
     const offer = await pc.createOffer();
 
-    if (
-      peers.get(viewerId) !== pc ||
-      !pendingViewers.has(viewerId)
-    ) {
-      return;
-    }
+    if (peer !== pc || !stream) return;
 
     await pc.setLocalDescription(offer);
 
-    if (peers.get(viewerId) !== pc) return;
+    if (peer !== pc) return;
 
     const sent = sendSocket({
       type: 'offer',
@@ -179,45 +169,42 @@ async function createViewerConnection(viewerId) {
     });
 
     if (!sent) {
-      closeViewer(viewerId);
-      status('ارسال درخواست اتصال ناموفق بود. اتصال گوشی را بررسی کن.', true);
+      closePeer();
+      status('ارسال درخواست اتصال ناموفق بود.', true);
       return;
     }
 
     status('درخواست اتصال تصویر ارسال شد.');
-
   } catch (error) {
-    console.error(error);
+    console.error('WebRTC error:', error);
 
-    if (!pc || peers.get(viewerId) === pc) {
-      closeViewer(viewerId);
-    }
+    if (!pc || peer === pc) closePeer();
 
     status(`ساخت اتصال ناموفق بود: ${error.message}`, true);
   }
 }
 
 async function handleAnswer(message) {
-  const viewerId = message.viewerId;
-  const pc = peers.get(viewerId);
+  if (!peer || !message.answer) return;
 
-  if (!pc || !message.answer) return;
+  if (message.viewerId && message.viewerId !== activeViewerId) return;
+
+  const pc = peer;
 
   try {
     await pc.setRemoteDescription(message.answer);
 
-    const candidates = pendingCandidates.get(viewerId) || [];
+    if (peer !== pc) return;
 
-    for (const candidate of candidates) {
+    while (pendingCandidates.length) {
+      const candidate = pendingCandidates.shift();
+
       try {
         await pc.addIceCandidate(candidate);
       } catch (error) {
         console.warn('Queued ICE error:', error);
       }
     }
-
-    pendingCandidates.set(viewerId, []);
-
   } catch (error) {
     console.error(error);
     status('دریافت پاسخ اتصال ناموفق بود.', true);
@@ -225,32 +212,126 @@ async function handleAnswer(message) {
 }
 
 async function handleIce(message) {
-  const viewerId = message.viewerId;
+  if (!message.candidate) return;
 
-  if (!viewerId || !message.candidate) return;
+  if (
+    message.viewerId &&
+    activeViewerId &&
+    message.viewerId !== activeViewerId
+  ) return;
 
-  const pc = peers.get(viewerId);
-
-  // ICE ممکن است قبل از Offer یا Answer برسد
-  if (!pc || !pc.remoteDescription) {
-    const candidates = pendingCandidates.get(viewerId) || [];
-    candidates.push(message.candidate);
-    pendingCandidates.set(viewerId, candidates);
+  if (!peer || !peer.remoteDescription) {
+    pendingCandidates.push(message.candidate);
     return;
   }
 
   try {
-    await pc.addIceCandidate(message.candidate);
+    await peer.addIceCandidate(message.candidate);
   } catch (error) {
     console.warn('ICE error:', error);
   }
 }
 
+function stopShare(notifyServer = true) {
+  if (stopping) return;
+
+  stopping = true;
+
+  closeAllPeers(true);
+
+  if (stream) {
+    const oldStream = stream;
+    stream = null;
+
+    oldStream.getTracks().forEach(track => {
+      try {
+        track.stop();
+      } catch (error) {
+        console.warn(error);
+      }
+    });
+  }
+
+  if (notifyServer) {
+    sendSocket({ type: 'stream-stopped' });
+  }
+
+  stopping = false;
+  status('اشتراک‌گذاری متوقف شد.');
+}
+
+function handleSocketMessage(message) {
+  switch (message.type) {
+    case 'registered':
+      reconnectAttempts = 0;
+      status('گوشی متصل شد. برای شروع، دکمه فعال‌سازی را بزن.');
+      $('#consentBox')?.classList.remove('hidden');
+      break;
+
+    case 'watch-request':
+      if (!message.viewerId) break;
+
+      if (activeViewerId && activeViewerId !== message.viewerId) {
+        break;
+      }
+
+      activeViewerId = message.viewerId;
+      pendingViewers.add(message.viewerId);
+
+      status('درخواست نمایش از لپ‌تاپ دریافت شد.');
+
+      if (stream) {
+        createViewerConnection(message.viewerId);
+      }
+
+      break;
+
+    case 'answer':
+      handleAnswer(message);
+      break;
+
+    case 'ice':
+      handleIce(message);
+      break;
+
+    case 'stop':
+      if (
+        !message.viewerId ||
+        message.viewerId === activeViewerId
+      ) {
+        closePeer();
+        status('نمایش توسط لپ‌تاپ متوقف شد.');
+      }
+      break;
+
+    case 'stream-stopped':
+      stopShare(false);
+      break;
+
+    case 'consent':
+      status('درخواست نمایش دریافت شد. اجازه اشتراک‌گذاری را تأیید کن.');
+      break;
+
+    case 'consent-denied':
+      status('اجازه نمایش داده نشد.', true);
+      break;
+
+    case 'error':
+      status(message.message || 'خطای ارتباط.', true);
+      break;
+  }
+}
+
 function connectPhone() {
   if (!room || room.length < 30) {
-    status('کد اتاق نامعتبر یا منقضی شده است. QR تازه بساز.', true);
+    status('کد اتاق نامعتبر است. از داشبورد QR جدید بگیر.', true);
     return;
   }
+
+  if (socket && (
+    socket.readyState === WebSocket.OPEN ||
+    socket.readyState === WebSocket.CONNECTING
+  )) return;
 
   deviceId = getDeviceId();
   manuallyDisconnected = false;
@@ -265,11 +346,11 @@ function connectPhone() {
     sendSocket({
       type: 'register',
       deviceId,
-      name: $('#deviceName').value.trim().slice(0, 40) || 'گوشی من'
+      name: $('#deviceName')?.value.trim().slice(0, 40) || 'گوشی من'
     });
   };
 
-  socket.onmessage = async event => {
+  socket.onmessage = event => {
     let message;
 
     try {
@@ -278,63 +359,15 @@ function connectPhone() {
       return;
     }
 
-    switch (message.type) {
-      case 'registered':
-        status('گوشی متصل شد. برای ارسال تصویر باید خودت اجازه بدهی.');
-        $('#consentBox').classList.remove('hidden');
-        break;
-
-      case 'watch-request':
-        if (!message.viewerId) break;
-
-        pendingViewers.add(message.viewerId);
-
-        status('داشبورد درخواست نمایش زنده داده است.');
-
-        if (stream) {
-          await createViewerConnection(message.viewerId);
-        }
-        break;
-
-      case 'answer':
-        await handleAnswer(message);
-        break;
-
-      case 'ice':
-        await handleIce(message);
-        break;
-
-      case 'stop':
-        if (message.viewerId) {
-          closeViewer(message.viewerId);
-          status('نمایش برای یکی از بیننده‌ها متوقف شد.');
-        }
-        break;
-
-      case 'stream-stopped':
-        stopShare(false);
-        status('اشتراک‌گذاری متوقف شد.');
-        break;
-
-      case 'consent':
-        status('درخواست نمایش دریافت شد. انتخاب صفحه با اجازه خودت انجام می‌شود.');
-        break;
-
-      case 'consent-denied':
-        status('اجازه نمایش داده نشد.', true);
-        break;
-
-      case 'error':
-        status(message.message || 'خطای ارتباط.', true);
-        break;
-    }
+    handleSocketMessage(message);
   };
 
-  socket.onerror = () => {
+  socket.onerror = error => {
+    console.warn('Socket error:', error);
     status('اتصال برقرار نشد. اینترنت و QR را بررسی کن.', true);
   };
 
-  socket.onclose = () => {
+  socket.onclose = event => {
     closeAllPeers(true);
 
     if (stream) {
@@ -348,17 +381,28 @@ function connectPhone() {
       });
     }
 
-    status('اتصال گوشی قطع شد. دوباره QR را اسکن کن.', true);
+    if (manuallyDisconnected) return;
 
-    if (!manuallyDisconnected) {
-      clearTimeout(reconnectTimer);
-
-      reconnectTimer = setTimeout(() => {
-        if (!manuallyDisconnected) {
-          connectPhone();
-        }
-      }, 3000);
+    // 4001 یعنی اتصال قبلی همین دستگاه جایگزین شده است.
+    if (event.code === 4001) {
+      status('این گوشی از یک اتصال دیگر جایگزین شده است.', true);
+      return;
     }
+
+    reconnectAttempts++;
+
+    if (reconnectAttempts > 3) {
+      status('اتصال برقرار نماند. QR تازه بساز و دوباره اسکن کن.', true);
+      return;
+    }
+
+    status('ارتباط قطع شد؛ تلاش برای اتصال مجدد...');
+
+    clearTimeout(reconnectTimer);
+
+    reconnectTimer = setTimeout(() => {
+      if (!manuallyDisconnected) connectPhone();
+    }, 2500);
   };
 }
 
@@ -368,18 +412,23 @@ async function startShare() {
     return;
   }
 
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    status('این مرورگر Screen Capture را پشتیبانی نمی‌کند. از مرورگر سازگار و HTTPS استفاده کن.', true);
-    return;
-  }
-
   if (stream) {
     status('اشتراک‌گذاری از قبل فعال است.');
     return;
   }
 
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    status(
+      'این مرورگر اشتراک‌گذاری صفحه را پشتیبانی نمی‌کند. از مرورگر سازگار و HTTPS استفاده کن.',
+      true
+    );
+    return;
+  }
+
   try {
-    // انتخاب صفحه فقط با اقدام و اجازه صریح صاحب گوشی
+    status('پنجره انتخاب صفحه باز می‌شود...');
+
+    // انتخاب صفحه فقط با اقدام و تأیید خود کاربر انجام می‌شود.
     const selectedStream = await navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: false
@@ -387,7 +436,7 @@ async function startShare() {
 
     if (socket.readyState !== WebSocket.OPEN) {
       selectedStream.getTracks().forEach(track => track.stop());
-      status('اتصال گوشی قطع شده است؛ دوباره متصل شو.', true);
+      status('اتصال گوشی قطع شده است؛ دوباره QR را اسکن کن.', true);
       return;
     }
 
@@ -397,7 +446,7 @@ async function startShare() {
 
     if (!videoTrack) {
       stopShare(false);
-      status('تصویری انتخاب نشد.', true);
+      status('صفحه‌ای انتخاب نشد.', true);
       return;
     }
 
@@ -412,67 +461,32 @@ async function startShare() {
     const viewers = [...pendingViewers];
 
     if (!viewers.length) {
-      status('اشتراک‌گذاری آماده است. منتظر درخواست داشبورد هستیم.');
+      status('اشتراک‌گذاری آماده است؛ منتظر درخواست لپ‌تاپ هستیم.');
       return;
     }
 
-    for (const viewerId of viewers) {
-      await createViewerConnection(viewerId);
-    }
-
-    status('اشتراک‌گذاری فعال است.');
-
+    await createViewerConnection(viewers[0]);
   } catch (error) {
     console.error(error);
 
     stopShare(false);
 
     if (error.name === 'NotAllowedError') {
-      status('اجازه داده نشد؛ هیچ تصویری ارسال نشد.', true);
+      status('اجازه اشتراک‌گذاری داده نشد.', true);
     } else {
       status(`شروع اشتراک‌گذاری ناموفق بود: ${error.message}`, true);
     }
   }
 }
 
-function stopShare(notifyServer = true) {
-  if (stopping) return;
-
-  stopping = true;
-
-  // بیننده‌ها حفظ می‌شوند تا پس از شروع مجدد دوباره متصل شوند
-  closeAllPeers(true);
-
-  if (stream) {
-    const oldStream = stream;
-    stream = null;
-
-    oldStream.getTracks().forEach(track => {
-      try {
-        track.stop();
-      } catch {}
-    });
-  }
-
-  if (notifyServer) {
-    sendSocket({
-      type: 'stream-stopped'
-    });
-  }
-
-  stopping = false;
-  status('اشتراک‌گذاری متوقف شد.');
-}
-
-// اتصال گوشی
-$('#shareForm').addEventListener('submit', event => {
+$('#shareForm')?.addEventListener('submit', event => {
   event.preventDefault();
 
   if (socket && (
     socket.readyState === WebSocket.OPEN ||
     socket.readyState === WebSocket.CONNECTING
   )) {
-    status('درخواست اتصال گوشی در حال انجام است.');
+    status('اتصال گوشی در حال انجام است.');
     return;
   }
 
@@ -480,23 +494,18 @@ $('#shareForm').addEventListener('submit', event => {
   connectPhone();
 });
 
-// شروع اشتراک‌گذاری
-$('#startShareBtn').addEventListener('click', startShare);
+$('#startShareBtn')?.addEventListener('click', startShare);
 
-// توقف اشتراک‌گذاری
-$('#stopShareBtn').addEventListener('click', () => {
+$('#stopShareBtn')?.addEventListener('click', () => {
   stopShare(true);
 });
 
-// خروج از صفحه
 window.addEventListener('beforeunload', () => {
   manuallyDisconnected = true;
   clearTimeout(reconnectTimer);
 
   if (stream) {
-    sendSocket({
-      type: 'stream-stopped'
-    });
+    sendSocket({ type: 'stream-stopped' });
 
     stream.getTracks().forEach(track => {
       try {
