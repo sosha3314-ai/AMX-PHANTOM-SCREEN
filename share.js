@@ -10,6 +10,8 @@ let deviceId = null;
 let stream = null;
 let iceConfig = null;
 let stopping = false;
+let reconnectTimer = null;
+let manuallyDisconnected = false;
 
 const peers = new Map();
 const pendingViewers = new Set();
@@ -76,7 +78,9 @@ function closeViewer(viewerId) {
 
     try {
       pc.close();
-    } catch {}
+    } catch (error) {
+      console.warn(error);
+    }
 
     peers.delete(viewerId);
   }
@@ -85,12 +89,23 @@ function closeViewer(viewerId) {
   pendingViewers.delete(viewerId);
 }
 
-function closeAllPeers() {
+function closeAllPeers(preservePending = false) {
+  const previousViewers = new Set([
+    ...pendingViewers,
+    ...peers.keys()
+  ]);
+
   for (const viewerId of [...peers.keys()]) {
     closeViewer(viewerId);
   }
 
   pendingViewers.clear();
+
+  if (preservePending) {
+    for (const viewerId of previousViewers) {
+      pendingViewers.add(viewerId);
+    }
+  }
 }
 
 async function createViewerConnection(viewerId) {
@@ -102,12 +117,16 @@ async function createViewerConnection(viewerId) {
     return;
   }
 
+  pendingViewers.add(viewerId);
+
+  let pc = null;
+
   try {
     const servers = await loadIceServers();
 
     if (!stream || !pendingViewers.has(viewerId)) return;
 
-    const pc = new RTCPeerConnection({
+    pc = new RTCPeerConnection({
       iceServers: servers
     });
 
@@ -119,17 +138,17 @@ async function createViewerConnection(viewerId) {
     });
 
     pc.onicecandidate = event => {
-      if (event.candidate) {
-        sendSocket({
-          type: 'ice',
-          viewerId,
-          candidate: event.candidate
-        });
-      }
+      if (!event.candidate) return;
+
+      sendSocket({
+        type: 'ice',
+        viewerId,
+        candidate: event.candidate
+      });
     };
 
     pc.onconnectionstatechange = () => {
-      if (!peers.has(viewerId)) return;
+      if (peers.get(viewerId) !== pc) return;
 
       if (pc.connectionState === 'connected') {
         status('اتصال نمایش زنده برقرار شد.');
@@ -142,21 +161,38 @@ async function createViewerConnection(viewerId) {
 
     const offer = await pc.createOffer();
 
-    if (!peers.has(viewerId)) return;
+    if (
+      peers.get(viewerId) !== pc ||
+      !pendingViewers.has(viewerId)
+    ) {
+      return;
+    }
 
     await pc.setLocalDescription(offer);
 
-    sendSocket({
+    if (peers.get(viewerId) !== pc) return;
+
+    const sent = sendSocket({
       type: 'offer',
       viewerId,
       offer: pc.localDescription
     });
 
+    if (!sent) {
+      closeViewer(viewerId);
+      status('ارسال درخواست اتصال ناموفق بود. اتصال گوشی را بررسی کن.', true);
+      return;
+    }
+
     status('درخواست اتصال تصویر ارسال شد.');
 
   } catch (error) {
     console.error(error);
-    closeViewer(viewerId);
+
+    if (!pc || peers.get(viewerId) === pc) {
+      closeViewer(viewerId);
+    }
+
     status(`ساخت اتصال ناموفق بود: ${error.message}`, true);
   }
 }
@@ -173,7 +209,11 @@ async function handleAnswer(message) {
     const candidates = pendingCandidates.get(viewerId) || [];
 
     for (const candidate of candidates) {
-      await pc.addIceCandidate(candidate).catch(console.warn);
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (error) {
+        console.warn('Queued ICE error:', error);
+      }
     }
 
     pendingCandidates.set(viewerId, []);
@@ -186,18 +226,21 @@ async function handleAnswer(message) {
 
 async function handleIce(message) {
   const viewerId = message.viewerId;
+
+  if (!viewerId || !message.candidate) return;
+
   const pc = peers.get(viewerId);
 
-  if (!pc || !message.candidate) return;
+  // ICE ممکن است قبل از Offer یا Answer برسد
+  if (!pc || !pc.remoteDescription) {
+    const candidates = pendingCandidates.get(viewerId) || [];
+    candidates.push(message.candidate);
+    pendingCandidates.set(viewerId, candidates);
+    return;
+  }
 
   try {
-    if (pc.remoteDescription) {
-      await pc.addIceCandidate(message.candidate);
-    } else {
-      const candidates = pendingCandidates.get(viewerId) || [];
-      candidates.push(message.candidate);
-      pendingCandidates.set(viewerId, candidates);
-    }
+    await pc.addIceCandidate(message.candidate);
   } catch (error) {
     console.warn('ICE error:', error);
   }
@@ -210,6 +253,7 @@ function connectPhone() {
   }
 
   deviceId = getDeviceId();
+  manuallyDisconnected = false;
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
@@ -291,8 +335,30 @@ function connectPhone() {
   };
 
   socket.onclose = () => {
-    closeAllPeers();
+    closeAllPeers(true);
+
+    if (stream) {
+      const oldStream = stream;
+      stream = null;
+
+      oldStream.getTracks().forEach(track => {
+        try {
+          track.stop();
+        } catch {}
+      });
+    }
+
     status('اتصال گوشی قطع شد. دوباره QR را اسکن کن.', true);
+
+    if (!manuallyDisconnected) {
+      clearTimeout(reconnectTimer);
+
+      reconnectTimer = setTimeout(() => {
+        if (!manuallyDisconnected) {
+          connectPhone();
+        }
+      }, 3000);
+    }
   };
 }
 
@@ -314,10 +380,18 @@ async function startShare() {
 
   try {
     // انتخاب صفحه فقط با اقدام و اجازه صریح صاحب گوشی
-    stream = await navigator.mediaDevices.getDisplayMedia({
+    const selectedStream = await navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: false
     });
+
+    if (socket.readyState !== WebSocket.OPEN) {
+      selectedStream.getTracks().forEach(track => track.stop());
+      status('اتصال گوشی قطع شده است؛ دوباره متصل شو.', true);
+      return;
+    }
+
+    stream = selectedStream;
 
     const videoTrack = stream.getVideoTracks()[0];
 
@@ -366,7 +440,8 @@ function stopShare(notifyServer = true) {
 
   stopping = true;
 
-  closeAllPeers();
+  // بیننده‌ها حفظ می‌شوند تا پس از شروع مجدد دوباره متصل شوند
+  closeAllPeers(true);
 
   if (stream) {
     const oldStream = stream;
@@ -393,11 +468,15 @@ function stopShare(notifyServer = true) {
 $('#shareForm').addEventListener('submit', event => {
   event.preventDefault();
 
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    status('گوشی از قبل متصل است.');
+  if (socket && (
+    socket.readyState === WebSocket.OPEN ||
+    socket.readyState === WebSocket.CONNECTING
+  )) {
+    status('درخواست اتصال گوشی در حال انجام است.');
     return;
   }
 
+  clearTimeout(reconnectTimer);
   connectPhone();
 });
 
@@ -411,14 +490,28 @@ $('#stopShareBtn').addEventListener('click', () => {
 
 // خروج از صفحه
 window.addEventListener('beforeunload', () => {
+  manuallyDisconnected = true;
+  clearTimeout(reconnectTimer);
+
   if (stream) {
-    sendSocket({ type: 'stream-stopped' });
+    sendSocket({
+      type: 'stream-stopped'
+    });
 
     stream.getTracks().forEach(track => {
-      track.stop();
+      try {
+        track.stop();
+      } catch {}
     });
   }
 
   closeAllPeers();
+
+  if (socket) {
+    try {
+      socket.close();
+    } catch {}
+  }
+
   stream = null;
 });
