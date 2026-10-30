@@ -1,9 +1,12 @@
+'use strict';
 
 require('dotenv').config();
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+
 const express = require('express');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
@@ -12,7 +15,6 @@ const rateLimit = require('express-rate-limit');
 const QRCode = require('qrcode');
 const { WebSocketServer, WebSocket } = require('ws');
 
-// database.js is in the project root.
 const {
   registerDevice,
   recordEvent,
@@ -28,6 +30,8 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 
@@ -37,7 +41,8 @@ const cookieSetting = String(
 
 const secureCookie =
   cookieSetting === 'true' ||
-  (cookieSetting === 'auto' && process.env.NODE_ENV === 'production');
+  (cookieSetting === 'auto' &&
+    process.env.NODE_ENV === 'production');
 
 if (
   DASHBOARD_PASSWORD.length < 16 ||
@@ -52,30 +57,6 @@ if (
 if (secureCookie) {
   app.set('trust proxy', 1);
 }
-
-let roomToken = crypto.randomBytes(32).toString('base64url');
-
-const startedAt = new Date().toISOString();
-
-const activeDevices = new Map();
-const sessions = new Map();
-
-const sessionMiddleware = session({
-  store: new SQLiteStore({
-    db: 'sessions.sqlite',
-    dir: DATA_DIR
-  }),
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  name: 'amx.sid',
-  cookie: {
-    httpOnly: true,
-    sameSite: 'strict',
-    secure: secureCookie,
-    maxAge: 8 * 60 * 60 * 1000
-  }
-});
 
 app.disable('x-powered-by');
 
@@ -95,6 +76,24 @@ app.use(helmet({
 }));
 
 app.use(express.json({ limit: '16kb' }));
+
+const sessionMiddleware = session({
+  store: new SQLiteStore({
+    db: 'sessions.sqlite',
+    dir: DATA_DIR
+  }),
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  name: 'amx.sid',
+  cookie: {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: secureCookie,
+    maxAge: 8 * 60 * 60 * 1000
+  }
+});
+
 app.use(sessionMiddleware);
 
 app.use('/api/login', rateLimit({
@@ -104,27 +103,21 @@ app.use('/api/login', rateLimit({
   legacyHeaders: false
 }));
 
-// Serve only public frontend assets.
-// Never expose server.js, database.js, .env or the data directory.
-app.get('/css/style.css', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'style.css'));
+let roomToken = crypto.randomBytes(32).toString('base64url');
+
+const startedAt = new Date().toISOString();
+
+const activeDevices = new Map();
+const sessions = new Map();
+
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 32 * 1024
 });
 
-app.get('/js/dashboard.js', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'dashboard.js'));
-});
-
-app.get('/js/login.js', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'login.js'));
-});
-
-app.get('/js/share.js', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'share.js'));
-});
-
-app.get('/assets/logo.svg', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'logo.svg'));
-});
+// ------------------------------
+// SECURITY HELPERS
+// ------------------------------
 
 function isAuthed(req) {
   return Boolean(
@@ -149,45 +142,89 @@ function safeString(value, max = 48) {
     : '';
 }
 
-function jsonSend(ws, obj) {
+function jsonSend(ws, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+    ws.send(JSON.stringify(data));
   }
 }
 
-function broadcastStatus() {
-  for (const ws of wss.clients) {
-    if (ws.role === 'dashboard') {
-      jsonSend(ws, {
-        type: 'status',
-        devices: [...sessions.entries()].map(([id, s]) => ({
-          id,
-          name: s.name,
-          connectedAt: s.connectedAt,
-          viewers: s.viewers.size
-        }))
-      });
+function getIceServers() {
+  const servers = [{
+    urls: process.env.STUN_URL ||
+      'stun:stun.l.google.com:19302'
+  }];
+
+  if (
+    process.env.TURN_URL &&
+    process.env.TURN_USERNAME &&
+    process.env.TURN_CREDENTIAL
+  ) {
+    servers.push({
+      urls: process.env.TURN_URL,
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL
+    });
+  }
+
+  return servers;
+}
+
+function getViewer(sess, viewerId) {
+  if (!sess || !viewerId) return null;
+
+  for (const viewer of sess.viewers) {
+    if (viewer.id === viewerId) {
+      return viewer;
     }
   }
+
+  return null;
 }
 
-function getDashboardPage(req) {
-  return path.join(
-    __dirname,
-    isAuthed(req) ? 'index.html' : 'login.html'
-  );
-}
+// ------------------------------
+// FRONTEND FILES
+// ------------------------------
 
-// Main pages
+app.get('/css/style.css', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'style.css'));
+});
+
+app.get('/js/dashboard.js', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'dashboard.js'));
+});
+
+app.get('/js/login.js', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'login.js'));
+});
+
+app.get('/js/share.js', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'share.js'));
+});
+
+app.get('/assets/logo.svg', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'logo.svg'));
+});
+
+// ------------------------------
+// MAIN PAGES
+// ------------------------------
+
 app.get('/', (req, res) => {
-  res.sendFile(getDashboardPage(req));
+  const page = isAuthed(req)
+    ? 'index.html'
+    : 'login.html';
+
+  res.sendFile(path.join(__dirname, page));
 });
 
 app.get('/share', (_req, res) => {
   res.sendFile(path.join(__dirname, 'share.html'));
 });
 
-// Health check for hosting platforms
+// ------------------------------
+// HEALTH CHECK
+// ------------------------------
+
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
@@ -196,16 +233,9 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Dashboard APIs
-app.get('/api/status', requireAuth, (_req, res) => {
-  res.json({
-    ok: true,
-    startedAt,
-    uptimeSeconds: Math.floor(process.uptime()),
-    activeCount: sessions.size,
-    registeredCount: listDevices().length
-  });
-});
+// ------------------------------
+// LOGIN
+// ------------------------------
 
 app.post('/api/login', (req, res, next) => {
   const password =
@@ -238,6 +268,10 @@ app.post('/api/login', (req, res, next) => {
   });
 });
 
+// ------------------------------
+// LOGOUT
+// ------------------------------
+
 app.post('/api/logout', requireAuth, (req, res) => {
   req.session.destroy(() => {
     res.clearCookie('amx.sid');
@@ -245,13 +279,14 @@ app.post('/api/logout', requireAuth, (req, res) => {
   });
 });
 
+// ------------------------------
+// QR ROOM
+// ------------------------------
+
 app.get('/api/room', requireAuth, async (req, res, next) => {
   try {
-    const host = req.get('host');
-    const protocol = req.protocol;
-
     const shareUrl =
-      `${protocol}://${host}/share?room=${encodeURIComponent(roomToken)}`;
+      `${req.protocol}://${req.get('host')}/share?room=${encodeURIComponent(roomToken)}`;
 
     const qr = await QRCode.toDataURL(shareUrl, {
       width: 260,
@@ -273,6 +308,24 @@ app.get('/api/room', requireAuth, async (req, res, next) => {
   }
 });
 
+// ------------------------------
+// DASHBOARD STATUS
+// ------------------------------
+
+app.get('/api/status', requireAuth, (_req, res) => {
+  res.json({
+    ok: true,
+    startedAt,
+    uptimeSeconds: Math.floor(process.uptime()),
+    activeCount: sessions.size,
+    registeredCount: listDevices().length
+  });
+});
+
+// ------------------------------
+// DEVICE LIST
+// ------------------------------
+
 app.get('/api/devices', requireAuth, (_req, res) => {
   res.json({
     devices: listDevices(),
@@ -281,11 +334,58 @@ app.get('/api/devices', requireAuth, (_req, res) => {
   });
 });
 
-// WebSocket signaling
-const wss = new WebSocketServer({
-  noServer: true,
-  maxPayload: 32 * 1024
+// ------------------------------
+// WEBRTC ICE CONFIGURATION
+// ------------------------------
+
+app.get('/api/ice-servers', (req, res) => {
+  const requestedRoom = req.query.room;
+
+  const authorized =
+    isAuthed(req) ||
+    (
+      typeof requestedRoom === 'string' &&
+      requestedRoom === roomToken
+    );
+
+  if (!authorized) {
+    return res.status(401).json({
+      error: 'دسترسی غیرمجاز'
+    });
+  }
+
+  res.set('Cache-Control', 'no-store');
+
+  res.json({
+    iceServers: getIceServers()
+  });
 });
+
+// ------------------------------
+// BROADCAST STATUS
+// ------------------------------
+
+function broadcastStatus() {
+  const devices = [...sessions.entries()].map(([id, s]) => ({
+    id,
+    name: s.name,
+    connectedAt: s.connectedAt,
+    viewers: s.viewers.size
+  }));
+
+  for (const ws of wss.clients) {
+    if (ws.role === 'dashboard') {
+      jsonSend(ws, {
+        type: 'status',
+        devices
+      });
+    }
+  }
+}
+
+// ------------------------------
+// WEBSOCKET AUTHENTICATION
+// ------------------------------
 
 server.on('upgrade', (req, socket, head) => {
   let url;
@@ -320,7 +420,6 @@ server.on('upgrade', (req, socket, head) => {
 
     wss.handleUpgrade(req, socket, head, ws => {
       ws.role = isDashboard ? 'dashboard' : 'phone';
-      ws.roomToken = isPhone ? roomToken : null;
       ws.id = crypto.randomUUID();
 
       wss.emit('connection', ws, req);
@@ -328,7 +427,12 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
+// ------------------------------
+// WEBSOCKET CONNECTION
+// ------------------------------
+
 wss.on('connection', ws => {
+
   ws.on('message', raw => {
     let msg;
 
@@ -345,8 +449,12 @@ wss.on('connection', ws => {
       return;
     }
 
-    // Phone registers itself
-    if (msg.type === 'register' && ws.role === 'phone') {
+    // PHONE REGISTRATION
+
+    if (
+      msg.type === 'register' &&
+      ws.role === 'phone'
+    ) {
       const id = safeString(msg.deviceId, 80);
 
       const name =
@@ -390,23 +498,28 @@ wss.on('connection', ws => {
       return;
     }
 
-    // Dashboard requests to watch a phone
-    if (msg.type === 'watch' && ws.role === 'dashboard') {
+    // DASHBOARD WATCH REQUEST
+
+    if (
+      msg.type === 'watch' &&
+      ws.role === 'dashboard'
+    ) {
       const id = safeString(msg.deviceId, 80);
       const phone = activeDevices.get(id);
+      const sess = sessions.get(id);
 
-      if (!phone || phone.readyState !== WebSocket.OPEN) {
+      if (
+        !phone ||
+        phone.readyState !== WebSocket.OPEN ||
+        !sess
+      ) {
         return jsonSend(ws, {
           type: 'error',
           message: 'این دستگاه آنلاین نیست.'
         });
       }
 
-      const sess = sessions.get(id);
-
-      if (sess) {
-        sess.viewers.add(ws);
-      }
+      sess.viewers.add(ws);
 
       if (!ws.watchingDevices) {
         ws.watchingDevices = new Set();
@@ -416,54 +529,109 @@ wss.on('connection', ws => {
 
       jsonSend(phone, {
         type: 'watch-request',
+        deviceId: id,
         viewerId: ws.id
       });
 
+      jsonSend(ws, {
+        type: 'watch-request-sent',
+        deviceId: id
+      });
+
+      broadcastStatus();
       return;
     }
 
-    // Phone sends WebRTC messages to all dashboards watching it
+    // PHONE TO VIEWER
+
     if (
       ws.role === 'phone' &&
-      ['offer', 'answer', 'ice', 'stream-stopped', 'consent-denied'].includes(msg.type)
+      [
+        'offer',
+        'ice',
+        'stream-stopped',
+        'consent-denied'
+      ].includes(msg.type)
     ) {
       const sess = sessions.get(ws.deviceId);
 
       if (!sess) return;
 
-      for (const viewer of sess.viewers) {
-        jsonSend(viewer, {
-          ...msg,
-          deviceId: ws.deviceId,
-          viewerId: viewer.id
-        });
-      }
-
       if (msg.type === 'stream-stopped') {
+        for (const viewer of sess.viewers) {
+          jsonSend(viewer, {
+            type: 'stream-stopped',
+            deviceId: ws.deviceId
+          });
+        }
+
         recordEvent(
           ws.deviceId,
           ws.deviceName,
           'stream-stopped'
         );
+
+        return;
       }
+
+      const viewerId = safeString(msg.viewerId, 80);
+      const viewer = getViewer(sess, viewerId);
+
+      if (!viewer) return;
+
+      jsonSend(viewer, {
+        ...msg,
+        deviceId: ws.deviceId,
+        viewerId
+      });
 
       return;
     }
 
-    // Dashboard sends WebRTC messages or commands to a phone
+    // DASHBOARD TO PHONE
+
     if (
       ws.role === 'dashboard' &&
-      ['answer', 'ice', 'consent', 'stop'].includes(msg.type)
+      [
+        'answer',
+        'ice',
+        'consent',
+        'stop'
+      ].includes(msg.type)
     ) {
       const id = safeString(msg.deviceId, 80);
       const phone = activeDevices.get(id);
+      const sess = sessions.get(id);
 
-      if (!phone || phone.readyState !== WebSocket.OPEN) {
+      if (
+        !phone ||
+        phone.readyState !== WebSocket.OPEN ||
+        !sess ||
+        !sess.viewers.has(ws)
+      ) {
+        return;
+      }
+
+      if (msg.type === 'stop') {
+        sess.viewers.delete(ws);
+
+        if (ws.watchingDevices) {
+          ws.watchingDevices.delete(id);
+        }
+
+        jsonSend(phone, {
+          type: 'stop',
+          deviceId: id,
+          viewerId: ws.id
+        });
+
+        broadcastStatus();
         return;
       }
 
       jsonSend(phone, {
         ...msg,
+        deviceId: id,
         viewerId: ws.id
       });
 
@@ -471,12 +639,26 @@ wss.on('connection', ws => {
     }
   });
 
+  // CONNECTION CLOSED
+
   ws.on('close', () => {
+
     if (
       ws.role === 'phone' &&
       ws.deviceId &&
       activeDevices.get(ws.deviceId) === ws
     ) {
+      const sess = sessions.get(ws.deviceId);
+
+      if (sess) {
+        for (const viewer of sess.viewers) {
+          jsonSend(viewer, {
+            type: 'stream-stopped',
+            deviceId: ws.deviceId
+          });
+        }
+      }
+
       activeDevices.delete(ws.deviceId);
       sessions.delete(ws.deviceId);
 
@@ -491,19 +673,39 @@ wss.on('connection', ws => {
       broadcastStatus();
     }
 
-    if (ws.role === 'dashboard' && ws.watchingDevices) {
+    if (
+      ws.role === 'dashboard' &&
+      ws.watchingDevices
+    ) {
       for (const id of ws.watchingDevices) {
         const sess = sessions.get(id);
 
         if (sess) {
           sess.viewers.delete(ws);
+
+          const phone = activeDevices.get(id);
+
+          jsonSend(phone, {
+            type: 'stop',
+            deviceId: id,
+            viewerId: ws.id
+          });
         }
       }
+
+      broadcastStatus();
     }
+  });
+
+  ws.on('error', err => {
+    console.error('WebSocket error:', err.message);
   });
 });
 
-// Error handler
+// ------------------------------
+// ERROR HANDLER
+// ------------------------------
+
 app.use((err, _req, res, _next) => {
   console.error(err);
 
@@ -514,16 +716,37 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+// ------------------------------
+// START SERVER
+// ------------------------------
+
 server.listen(PORT, HOST, () => {
   console.log(
     `AMX PHANTOM SCREEN running on ${HOST}:${PORT}`
   );
 });
 
-process.on('SIGINT', () => {
+// ------------------------------
+// SHUTDOWN
+// ------------------------------
+
+function shutdown() {
+  console.log('Shutting down AMX PHANTOM SCREEN...');
+
+  for (const ws of wss.clients) {
+    try {
+      ws.close(1001, 'server shutdown');
+    } catch {}
+  }
+
   wss.close();
 
   server.close(() => {
     process.exit(0);
   });
-});
+
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
