@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="AMX Phantom Screen logo">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#00ff88"/><stop offset="1" stop-color="#008d4d"/></linearGradient><filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+  <rect x="5" y="5" width="118" height="118" rx="26" fill="#07100b" stroke="#1d5938" stroke-width="2"/>
+  <path d="M25 83 48 31h13l23 52H69l-4-11H44l-5 11zm23-23h13l-6-16z" fill="url(#g)" filter="url(#glow)"/>
+  <path d="M82 42h22M82 53h16M82 64h22M82 75h13" stroke="#00ff88" stroke-width="3" stroke-linecap="round"/>
+  <path d="M20 96h88" stroke="#17482e" stroke-width="2"/>
+  <text x="64" y="111" fill="#9affc8" font-size="9" text-anchor="middle" font-family="Arial,sans-serif" letter-spacing="2">PHANTOM</text>
+</svg>
