@@ -378,12 +378,11 @@ async function handleOffer(message) {
 
   const key = `${deviceId}:${viewerId}`;
 
-  closePeer(deviceId, viewerId);
+const earlyCandidates = pendingCandidates.get(key) || [];
 
-  // صف جدید را فقط در صورت نبودن صف قبلی ایجاد می‌کنیم.
-  if (!pendingCandidates.has(key)) {
-    pendingCandidates.set(key, []);
-  }
+closePeer(deviceId, viewerId);
+
+pendingCandidates.set(key, earlyCandidates);
 
   let pc = null;
 
